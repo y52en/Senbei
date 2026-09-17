@@ -28,13 +28,9 @@ pub const DYNAMIC_SECTION_NAMES: [&str; 8] = [
 ];
 
 /// Dynamic sections needed to identify a protected image before extraction.
-pub const PROBE_SECTION_NAMES: [&str; 5] = [
-    ".dynsym",
-    ".dynstr",
-    ".gnu.hash",
-    ".gnu.version",
-    ".gnu.version_r",
-];
+/// `.gnu.hash` is not universal: some 2017-era builds ship SysV (`.hash`)
+/// tables instead, and the restoration rebuilds both styles.
+pub const PROBE_SECTION_NAMES: [&str; 4] = [".dynsym", ".dynstr", ".gnu.version", ".gnu.version_r"];
 
 /// ELF64 dynamic table record sizes.
 pub const ELF64_SYMBOL_SIZE: usize = 0x18;

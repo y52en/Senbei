@@ -757,8 +757,21 @@ fn dynamic_contains_tag(output: &[u8], dynamic: SectionHeader, wanted: u64) -> R
 }
 
 fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, usize>> {
-    let mut result = HashMap::with_capacity(senbei_elf::DYNAMIC_SECTION_NAMES.len());
+    let hash_tables = [".gnu.hash", ".hash"];
+    let present = hash_tables
+        .iter()
+        .filter(|name| names.iter().any(|section| section == *name))
+        .count();
+    if present == 0 {
+        return invalid(
+            "ELF must carry at least one of the .gnu.hash / .hash symbol-hash sections",
+        );
+    }
+    let mut result = HashMap::with_capacity(senbei_elf::DYNAMIC_SECTION_NAMES.len() - 1);
     for required in senbei_elf::DYNAMIC_SECTION_NAMES {
+        if required == ".gnu.hash" {
+            continue;
+        }
         let indices = names
             .iter()
             .enumerate()
@@ -772,17 +785,19 @@ fn required_section_indices(names: &[String]) -> Result<HashMap<&'static str, us
             _ => return invalid(format!("ELF contains duplicate section {required}")),
         }
     }
-    let sysv_hash = names
-        .iter()
-        .enumerate()
-        .filter_map(|(index, name)| (name == ".hash").then_some(index))
-        .collect::<Vec<_>>();
-    match sysv_hash.as_slice() {
-        [index] => {
-            result.insert(".hash", *index);
+    for hash_table in hash_tables {
+        let indices = names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| (name == hash_table).then_some(index))
+            .collect::<Vec<_>>();
+        match indices.as_slice() {
+            [index] => {
+                result.insert(hash_table, *index);
+            }
+            [] => {}
+            _ => return invalid(format!("ELF contains duplicate section {hash_table}")),
         }
-        [] => {}
-        _ => return invalid("ELF contains duplicate section .hash"),
     }
     Ok(result)
 }
@@ -1100,6 +1115,16 @@ fn materialize_static_elf_tables(
     let rela_dyn_count = merged_rela_dyn.len() / ELF64_RELA_SIZE;
     let rela_plt_count = merged_rela_plt.len() / ELF64_RELA_SIZE;
 
+    let gnu_hash = indices.get(".gnu.hash").map(|index| {
+        (
+            *index,
+            TablePayload {
+                name: ".gnu.hash",
+                alignment: 8,
+                data: gnu_hash_table,
+            },
+        )
+    });
     let mut tables = vec![
         TablePayload {
             name: ".dynsym",
@@ -1116,12 +1141,10 @@ fn materialize_static_elf_tables(
             alignment: 4,
             data: version_requirements,
         },
-        TablePayload {
-            name: ".gnu.hash",
-            alignment: 8,
-            data: gnu_hash_table,
-        },
     ];
+    if let Some((_, payload)) = gnu_hash {
+        tables.push(payload);
+    }
     if let Some(data) = sysv_hash {
         tables.push(TablePayload {
             name: ".hash",
@@ -1224,10 +1247,12 @@ fn materialize_static_elf_tables(
         (DT_RELASZ, (rela_dyn_count * ELF64_RELA_SIZE) as u64),
         (DT_STRSZ, new_dynstr_size as u64),
         (DT_JMPREL, section_address(".rela.plt")),
-        (DT_GNU_HASH, section_address(".gnu.hash")),
         (DT_VERSYM, section_address(".gnu.version")),
         (DT_VERNEED, section_address(".gnu.version_r")),
     ]);
+    if indices.contains_key(".gnu.hash") {
+        dynamic_values.insert(DT_GNU_HASH, section_address(".gnu.hash"));
+    }
     if dynamic_contains_tag(output, dynamic, DT_RELACOUNT)? {
         dynamic_values.insert(DT_RELACOUNT, relative_count as u64);
     }

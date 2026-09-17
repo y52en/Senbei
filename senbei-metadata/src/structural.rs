@@ -29,11 +29,12 @@
 
 use crate::common::MAGIC;
 
-/// Metadata format version this de-obfuscator understands. The struct strides
-/// and header field offsets below are specific to it; other versions are left
+/// Metadata format versions this de-obfuscator understands. The struct strides
+/// and header field offsets below are version-specific; other versions are left
 /// untouched rather than risk corrupting a layout we have not verified.
-/// (Observed on real games shipping version 31 / Unity 2022.3.)
+/// (v31 observed on real games shipping Unity 2022.3; v24 on Unity 2017.1.)
 const SUPPORTED_VERSION: u32 = 31;
+const SUPPORTED_VERSION_V24: u32 = 24;
 
 // --- Il2CppGlobalMetadataHeader field byte-offsets (each is an i32 offset/size
 //     pair). Shared layout across recent versions. ---
@@ -50,6 +51,18 @@ const TYPE_METHOD_COUNT_OFF: usize = 0x40; // .method_count (u16)
 const IMAGE_STRIDE: usize = 0x28; // sizeof(Il2CppImageDefinition)
 const IMAGE_TYPE_START_OFF: usize = 0x08; // .typeStart (i32)
 const IMAGE_TYPE_COUNT_OFF: usize = 0x0C; // .typeCount (u32)
+
+// --- version-24 (Unity 2017.x) struct strides and field offsets ---
+// The header's table order differs from v31: typeDefinitions stay at 0xA0 but
+// images move to 0xB0 (0xA8 holds the assemblies table). Il2CppMethodDefinition
+// is smaller (0x34) with its token later in the record; Il2CppTypeDefinition is
+// larger (0x64) with methodStart/methodCount relocated.
+const V24_METHOD_STRIDE: usize = 0x34;
+const V24_METHOD_TOKEN_OFF: usize = 0x28;
+const V24_TYPE_STRIDE: usize = 0x64;
+const V24_TYPE_METHOD_START_OFF: usize = 0x30; // .methodStart (i32)
+const V24_TYPE_METHOD_COUNT_OFF: usize = 0x4C; // .method_count (u16)
+const V24_HDR_IMAGES: usize = 0xB0;
 
 /// `IMAGE_CODE_GEN_MODULE` method-definition token table id (`0x06 << 24`).
 const METHOD_TOKEN_TABLE: u32 = 0x0600_0000;
@@ -93,6 +106,38 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 
+/// Per-version struct layout the de-obfuscator needs.
+struct Layout {
+    hdr_images: usize,
+    method_stride: usize,
+    method_token_off: usize,
+    type_stride: usize,
+    type_method_start_off: usize,
+    type_method_count_off: usize,
+}
+
+fn layout_for(version: u32) -> Option<Layout> {
+    match version {
+        SUPPORTED_VERSION => Some(Layout {
+            hdr_images: HDR_IMAGES,
+            method_stride: METHOD_STRIDE,
+            method_token_off: METHOD_TOKEN_OFF,
+            type_stride: TYPE_STRIDE,
+            type_method_start_off: TYPE_METHOD_START_OFF,
+            type_method_count_off: TYPE_METHOD_COUNT_OFF,
+        }),
+        SUPPORTED_VERSION_V24 => Some(Layout {
+            hdr_images: V24_HDR_IMAGES,
+            method_stride: V24_METHOD_STRIDE,
+            method_token_off: V24_METHOD_TOKEN_OFF,
+            type_stride: V24_TYPE_STRIDE,
+            type_method_start_off: V24_TYPE_METHOD_START_OFF,
+            type_method_count_off: V24_TYPE_METHOD_COUNT_OFF,
+        }),
+        _ => None,
+    }
+}
+
 /// Cheap check for the il2cpp metadata sanity magic, for scanning prefixes.
 pub fn is_metadata(data: &[u8]) -> bool {
     rd_u32(data, 0) == Some(MAGIC)
@@ -108,22 +153,23 @@ pub fn deobfuscate(data: &[u8]) -> Result<(Vec<u8>, Report), Error> {
         return Err(Error::NotMetadata);
     }
     let version = rd_u32(data, 4).ok_or(Error::Malformed)?;
-    if version != SUPPORTED_VERSION {
-        return Err(Error::UnsupportedVersion(version));
-    }
+    let layout = layout_for(version).ok_or(Error::UnsupportedVersion(version))?;
 
     let (m_off, m_size) = table(data, HDR_METHODS)?;
     let (t_off, t_size) = table(data, HDR_TYPES)?;
-    let (i_off, i_size) = table(data, HDR_IMAGES)?;
+    let (i_off, i_size) = table(data, layout.hdr_images)?;
 
     // The strides must divide their tables exactly and the tables must lie
-    // within the file: a mismatch means our version-31 layout is wrong for this
-    // file, so bail without touching it rather than scribble at bad offsets.
-    if m_size % METHOD_STRIDE != 0 || t_size % TYPE_STRIDE != 0 || i_size % IMAGE_STRIDE != 0 {
+    // within the file: a mismatch means our layout is wrong for this file, so
+    // bail without touching it rather than scribble at bad offsets.
+    if m_size % layout.method_stride != 0
+        || t_size % layout.type_stride != 0
+        || i_size % IMAGE_STRIDE != 0
+    {
         return Err(Error::Malformed);
     }
-    let method_count = m_size / METHOD_STRIDE;
-    let type_count = t_size / TYPE_STRIDE;
+    let method_count = m_size / layout.method_stride;
+    let type_count = t_size / layout.type_stride;
     let image_count = i_size / IMAGE_STRIDE;
     if !fits(data, m_off, m_size) || !fits(data, t_off, t_size) || !fits(data, i_off, i_size) {
         return Err(Error::Malformed);
@@ -143,9 +189,9 @@ pub fn deobfuscate(data: &[u8]) -> Result<(Vec<u8>, Report), Error> {
             if t as usize >= type_count {
                 return Err(Error::Malformed);
             }
-            let tb = t_off + (t as usize) * TYPE_STRIDE;
-            let ms = rd_u32(data, tb + TYPE_METHOD_START_OFF).ok_or(Error::Malformed)?;
-            let mc = rd_u16(data, tb + TYPE_METHOD_COUNT_OFF).ok_or(Error::Malformed)? as u32;
+            let tb = t_off + (t as usize) * layout.type_stride;
+            let ms = rd_u32(data, tb + layout.type_method_start_off).ok_or(Error::Malformed)?;
+            let mc = rd_u16(data, tb + layout.type_method_count_off).ok_or(Error::Malformed)? as u32;
             if ms == NO_METHODS || mc == 0 {
                 continue;
             }
@@ -177,7 +223,7 @@ pub fn deobfuscate(data: &[u8]) -> Result<(Vec<u8>, Report), Error> {
         let first = module_first[img as usize];
         let local = (mi as u32) - first; // mi >= first by construction
         let new_tok = METHOD_TOKEN_TABLE | ((local + 1) & 0x00FF_FFFF);
-        let off = m_off + mi * METHOD_STRIDE + METHOD_TOKEN_OFF;
+        let off = m_off + mi * layout.method_stride + layout.method_token_off;
         // `fits` above guarantees this 4-byte write is in bounds.
         if out[off..off + 4] != new_tok.to_le_bytes() {
             out[off..off + 4].copy_from_slice(&new_tok.to_le_bytes());
@@ -343,5 +389,92 @@ mod tests {
             deobfuscate(&built.bytes).unwrap_err(),
             Error::UnsupportedVersion(29)
         );
+    }
+
+    // Minimal structurally valid v24 metadata: v24's images table lives at
+    // header 0xB0 (not 0xA8) and its method/type strides differ from v31.
+    struct BuiltV24 {
+        bytes: Vec<u8>,
+        m_off: usize,
+    }
+    fn build_v24(method_tokens: &[u32]) -> BuiltV24 {
+        let hdr = 0x100usize;
+        let images = hdr;
+        let i_count = 2;
+        let i_size = i_count * IMAGE_STRIDE;
+        let types = images + i_size;
+        let t_count = 2;
+        let t_size = t_count * V24_TYPE_STRIDE;
+        let methods = types + t_size;
+        let m_count = method_tokens.len();
+        let m_size = m_count * V24_METHOD_STRIDE;
+        let mut b = vec![0u8; methods + m_size];
+
+        let put32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let put16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+
+        put32(&mut b, 0, MAGIC);
+        put32(&mut b, 4, SUPPORTED_VERSION_V24);
+        put32(&mut b, HDR_METHODS, methods as u32);
+        put32(&mut b, HDR_METHODS + 4, m_size as u32);
+        put32(&mut b, HDR_TYPES, types as u32);
+        put32(&mut b, HDR_TYPES + 4, t_size as u32);
+        put32(&mut b, V24_HDR_IMAGES, images as u32);
+        put32(&mut b, V24_HDR_IMAGES + 4, i_size as u32);
+
+        put32(&mut b, images + IMAGE_TYPE_START_OFF, 0);
+        put32(&mut b, images + IMAGE_TYPE_COUNT_OFF, 1);
+        put32(&mut b, images + IMAGE_STRIDE + IMAGE_TYPE_START_OFF, 1);
+        put32(&mut b, images + IMAGE_STRIDE + IMAGE_TYPE_COUNT_OFF, 1);
+        put32(&mut b, types + V24_TYPE_METHOD_START_OFF, 0);
+        put16(&mut b, types + V24_TYPE_METHOD_COUNT_OFF, 2);
+        put32(&mut b, types + V24_TYPE_STRIDE + V24_TYPE_METHOD_START_OFF, 2);
+        put16(&mut b, types + V24_TYPE_STRIDE + V24_TYPE_METHOD_COUNT_OFF, 3);
+        for (i, &tok) in method_tokens.iter().enumerate() {
+            put32(&mut b, methods + i * V24_METHOD_STRIDE + V24_METHOD_TOKEN_OFF, tok);
+        }
+        BuiltV24 {
+            bytes: b,
+            m_off: methods,
+        }
+    }
+
+    #[test]
+    fn remaps_obfuscated_v24_method_tokens_per_module() {
+        let built = build_v24(&[
+            0x0600_D49F,
+            0x0600_FFFF,
+            0x0600_1234,
+            0x0600_ABCD,
+            0x0600_5555,
+        ]);
+        let (out, r) = deobfuscate(&built.bytes).expect("ok");
+        assert_eq!(r.version, 24);
+        assert_eq!(r.methods, 5);
+        assert_eq!(r.modules, 2);
+        assert_eq!(r.remapped, 5);
+        let tok24 = |b: &[u8], i: usize| {
+            rd_u32(b, built.m_off + i * V24_METHOD_STRIDE + V24_METHOD_TOKEN_OFF).unwrap()
+        };
+        assert_eq!(tok24(&out, 0), 0x0600_0001);
+        assert_eq!(tok24(&out, 1), 0x0600_0002);
+        assert_eq!(tok24(&out, 2), 0x0600_0001);
+        assert_eq!(tok24(&out, 3), 0x0600_0002);
+        assert_eq!(tok24(&out, 4), 0x0600_0003);
+    }
+
+    #[test]
+    fn v24_clean_metadata_is_byte_identical() {
+        let clean = [
+            0x0600_0001,
+            0x0600_0002,
+            0x0600_0001,
+            0x0600_0002,
+            0x0600_0003,
+        ];
+        let built = build_v24(&clean);
+        let (out, r) = deobfuscate(&built.bytes).expect("ok");
+        assert_eq!(r.remapped, 0);
+        assert_eq!(out, built.bytes);
     }
 }
