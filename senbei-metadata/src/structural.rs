@@ -191,7 +191,8 @@ pub fn deobfuscate(data: &[u8]) -> Result<(Vec<u8>, Report), Error> {
             }
             let tb = t_off + (t as usize) * layout.type_stride;
             let ms = rd_u32(data, tb + layout.type_method_start_off).ok_or(Error::Malformed)?;
-            let mc = rd_u16(data, tb + layout.type_method_count_off).ok_or(Error::Malformed)? as u32;
+            let mc =
+                rd_u16(data, tb + layout.type_method_count_off).ok_or(Error::Malformed)? as u32;
             if ms == NO_METHODS || mc == 0 {
                 continue;
             }
@@ -428,10 +429,22 @@ mod tests {
         put32(&mut b, images + IMAGE_STRIDE + IMAGE_TYPE_COUNT_OFF, 1);
         put32(&mut b, types + V24_TYPE_METHOD_START_OFF, 0);
         put16(&mut b, types + V24_TYPE_METHOD_COUNT_OFF, 2);
-        put32(&mut b, types + V24_TYPE_STRIDE + V24_TYPE_METHOD_START_OFF, 2);
-        put16(&mut b, types + V24_TYPE_STRIDE + V24_TYPE_METHOD_COUNT_OFF, 3);
+        put32(
+            &mut b,
+            types + V24_TYPE_STRIDE + V24_TYPE_METHOD_START_OFF,
+            2,
+        );
+        put16(
+            &mut b,
+            types + V24_TYPE_STRIDE + V24_TYPE_METHOD_COUNT_OFF,
+            3,
+        );
         for (i, &tok) in method_tokens.iter().enumerate() {
-            put32(&mut b, methods + i * V24_METHOD_STRIDE + V24_METHOD_TOKEN_OFF, tok);
+            put32(
+                &mut b,
+                methods + i * V24_METHOD_STRIDE + V24_METHOD_TOKEN_OFF,
+                tok,
+            );
         }
         BuiltV24 {
             bytes: b,
@@ -454,7 +467,11 @@ mod tests {
         assert_eq!(r.modules, 2);
         assert_eq!(r.remapped, 5);
         let tok24 = |b: &[u8], i: usize| {
-            rd_u32(b, built.m_off + i * V24_METHOD_STRIDE + V24_METHOD_TOKEN_OFF).unwrap()
+            rd_u32(
+                b,
+                built.m_off + i * V24_METHOD_STRIDE + V24_METHOD_TOKEN_OFF,
+            )
+            .unwrap()
         };
         assert_eq!(tok24(&out, 0), 0x0600_0001);
         assert_eq!(tok24(&out, 1), 0x0600_0002);

@@ -1175,8 +1175,12 @@ fn materialize_static_elf_tables(
     let mut capacity_end = metadata_capacity_end(layout, &indices, metadata_start)?;
     if cursor > capacity_end {
         let alignment = layout.load_alignment()?;
+        let program_header_reservation = layout.additional_program_header_reservation()?;
         let extension_start = align_up(layout.private_section()?.offset, alignment)?;
-        let extension_end = table_end(&tables, extension_start)?;
+        let extension_metadata_start = extension_start
+            .checked_add(program_header_reservation as u64)
+            .ok_or_else(|| Error::Invalid("dynamic-table extension start overflow".to_owned()))?;
+        let extension_end = table_end(&tables, extension_metadata_start)?;
         let extension_size = extension_end
             .checked_sub(extension_start)
             .ok_or_else(|| Error::Invalid("dynamic-table extension underflow".to_owned()))?;
@@ -1191,8 +1195,9 @@ fn materialize_static_elf_tables(
                 flags: PF_R,
                 alignment,
             },
+            program_header_reservation,
         )?;
-        metadata_start = extension_start;
+        metadata_start = extension_metadata_start;
         (placements, cursor) = table_placements(&tables, metadata_start)?;
         capacity_end = cursor;
     }
